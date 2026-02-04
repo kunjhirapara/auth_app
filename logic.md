@@ -1,485 +1,813 @@
-Alright, let’s treat this like a proper system design / planning phase for a production-grade auth system in Next.js using:
+# 🔐 Production-Grade Authentication System
 
-Next.js (App Router)
+> A comprehensive system design and implementation guide for building a secure authentication system in Next.js.
 
-bcryptjs – password hashing
+---
 
-MySQL (mysql2) – persistent user data
+## 📚 Table of Contents
 
-Redis – session / token control
+- [Overview](#overview)
+- [Tech Stack](#tech-stack)
+- [Architecture](#architecture)
+  - [Auth Strategy](#1-auth-strategy)
+  - [Token Design](#2-token-design)
+  - [Redis Usage](#3-redis-usage)
+  - [Database Schema](#4-database-schema)
+- [Project Structure](#project-structure)
+  - [Backend Structure](#5-backend-folder-structure)
+  - [Frontend Structure](#6-frontend-folder-structure)
+- [Core Utilities](#7-core-utilities)
+- [API Flows](#8-api-flows)
+- [Frontend Integration](#frontend-integration)
+  - [Auth State Strategy](#9-frontend-auth-state-strategy)
+  - [Signup Flow](#10-signup-flow)
+  - [Sign In Flow](#11-sign-in-flow)
+  - [Protected Routes](#12-protected-routes)
+  - [Token Expiry Handling](#13-token-expiry-handling)
+- [Middleware Protection](#14-middleware-protection)
+- [Security Checklist](#15-security-checklist)
+- [Flow Diagrams](#16-flow-diagrams)
 
-Access Token + Refresh Token (JWT-based)
+---
 
-I’ll walk you through architecture → data flow → security decisions → folder structure → implementation blueprint.
-No hand-wavy stuff.
+## Overview
 
-1️⃣ Auth Strategy (High-Level)
-Why this approach?
+This document outlines a **production-grade authentication system** using JWT-based access and refresh tokens, with proper session management, token rotation, and security best practices.
 
-JWT access token → fast, stateless auth for APIs
+**Key Principles:**
+- 🔒 Security-first approach
+- 🚀 Scalable architecture
+- 🔄 Token rotation for enhanced security
+- 📊 Audit trail support
 
-JWT refresh token → long-lived, securely rotated
+---
 
-Redis → revocation, rotation tracking, session invalidation
+## Tech Stack
 
-MySQL → source of truth (users, roles, audit)
+| Technology | Purpose |
+|------------|---------|
+| **Next.js** (App Router) | Full-stack React framework |
+| **bcryptjs** | Password hashing |
+| **MySQL** (mysql2) | Persistent user data storage |
+| **Redis** | Session/token control & revocation |
+| **JWT** | Access & Refresh tokens |
 
-HTTP-only cookies → XSS-safe storage
+---
 
-This is the same pattern used in real SaaS products.
+## Architecture
 
-2️⃣ Token Design
-Access Token
+### 1. Auth Strategy
 
-Short-lived (5–15 minutes)
+#### Why This Approach?
 
-Contains:
+| Component | Purpose |
+|-----------|---------|
+| JWT Access Token | Fast, stateless authentication for APIs |
+| JWT Refresh Token | Long-lived, securely rotated sessions |
+| Redis | Revocation, rotation tracking, session invalidation |
+| MySQL | Source of truth (users, roles, audit logs) |
+| HTTP-only Cookies | XSS-safe token storage |
 
+> 💡 This is the same pattern used in production SaaS applications.
+
+---
+
+### 2. Token Design
+
+#### Access Token
+
+| Property | Value |
+|----------|-------|
+| Lifetime | 5–15 minutes (short-lived) |
+| Storage | HTTP-only cookie |
+| Usage | Every protected request |
+
+**Payload Structure:**
+
+```json
 {
   "sub": "user_id",
   "email": "user@email.com",
   "role": "user",
-  "iat": 123,
-  "exp": 123
+  "iat": 1234567890,
+  "exp": 1234568790
 }
+```
 
+#### Refresh Token
 
-Stored in HTTP-only cookie
+| Property | Value |
+|----------|-------|
+| Lifetime | 7–30 days (long-lived) |
+| Storage | HTTP-only cookie |
+| Identifier | `jti` (JWT ID) stored in Redis |
+| Security | Rotated on every refresh |
 
-Used on every protected request
+---
 
-Refresh Token
+### 3. Redis Usage
 
-Long-lived (7–30 days)
+> ⚠️ **Redis is NOT optional if you want real security.**
 
-Stored in HTTP-only cookie
+#### What Redis Stores
 
-Has an ID (jti) → stored in Redis
+```
+Key Pattern: refresh:{userId}:{tokenId}
+Value: "valid"
+```
 
-Rotated on every refresh
+#### Why Redis?
 
-3️⃣ Redis Usage (Important)
+| Feature | Benefit |
+|---------|---------|
+| Instant logout | Immediately invalidate sessions |
+| Token rotation | Track current valid tokens |
+| Reuse attack detection | Detect stolen/replayed tokens |
+| Session management | Kill all sessions if compromised |
 
-Redis is NOT optional if you want real security.
+---
 
-What Redis stores
-refresh:{userId}:{tokenId} → valid
+### 4. Database Schema
 
-Why?
+#### Users Table
 
-Instant logout
-
-Token rotation
-
-Detect reuse attacks
-
-Kill all sessions if needed
-
-4️⃣ Database Schema (MySQL)
-users table
+```sql
 CREATE TABLE users (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
   email VARCHAR(255) UNIQUE NOT NULL,
   password_hash VARCHAR(255) NOT NULL,
-  role ENUM('user','admin') DEFAULT 'user',
+  role ENUM('user', 'admin') DEFAULT 'user',
   is_active BOOLEAN DEFAULT true,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+```
 
-(Optional but recommended)
+#### Login Audit Table (Recommended)
+
+```sql
 CREATE TABLE login_audit (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
   user_id BIGINT,
   ip_address VARCHAR(45),
   user_agent TEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id)
 );
+```
 
-5️⃣ Folder Structure (Production-Ready)
+---
+
+## Project Structure
+
+### 5. Backend Folder Structure
+
+```
 src/
 ├── app/
 │   ├── api/
 │   │   └── auth/
 │   │       ├── login/
-│   │       │   └── route.ts
+│   │       │   └── route.ts       # POST - User login
 │   │       ├── register/
-│   │       │   └── route.ts
+│   │       │   └── route.ts       # POST - User registration
 │   │       ├── refresh/
-│   │       │   └── route.ts
+│   │       │   └── route.ts       # POST - Token refresh
 │   │       ├── logout/
-│   │       │   └── route.ts
+│   │       │   └── route.ts       # POST - User logout
 │   │       └── me/
-│   │           └── route.ts
+│   │           └── route.ts       # GET - Current user info
 │   ├── (protected)/
 │   │   └── dashboard/
-│   │       └── page.tsx
-│   └── middleware.ts
+│   │       └── page.tsx           # Protected dashboard page
+│   └── middleware.ts              # Auth middleware
 │
 ├── lib/
 │   ├── db/
-│   │   ├── mysql.ts
-│   │   └── redis.ts
+│   │   ├── mysql.ts               # MySQL connection pool
+│   │   └── redis.ts               # Redis client
 │   │
 │   ├── auth/
-│   │   ├── hash.ts
-│   │   ├── jwt.ts
-│   │   ├── cookies.ts
-│   │   ├── token.ts
-│   │   └── auth-guard.ts
+│   │   ├── hash.ts                # Password hashing utilities
+│   │   ├── jwt.ts                 # JWT sign/verify functions
+│   │   ├── cookies.ts             # Cookie management
+│   │   ├── token.ts               # Token generation logic
+│   │   └── auth-guard.ts          # Route protection helpers
 │   │
 │   ├── validators/
-│   │   └── auth.schema.ts
+│   │   └── auth.schema.ts         # Zod validation schemas
 │   │
 │   └── utils/
-│       └── response.ts
+│       └── response.ts            # Standardized API responses
 │
 ├── types/
-│   └── auth.d.ts
+│   └── auth.d.ts                  # TypeScript type definitions
 │
 └── config/
-    └── env.ts
+    └── env.ts                     # Environment configuration
+```
 
-6️⃣ Core Utilities (Design-Level)
-Password Hashing (bcryptjs)
-hash(password)
-compare(password, hash)
-saltRounds = 12
+### 6. Frontend Folder Structure
 
-
-✔ Never store plain text
-✔ Never reuse salts
-
-JWT Handling
-
-Access Token Secret
-
-Refresh Token Secret
-
-Separate secrets (VERY IMPORTANT)
-
-signAccessToken(payload)
-signRefreshToken(payload, jti)
-verifyAccessToken(token)
-verifyRefreshToken(token)
-
-Cookie Strategy
-access_token  → httpOnly, sameSite=strict, secure
-refresh_token → httpOnly, sameSite=strict, secure
-
-
-No localStorage. Ever.
-
-7️⃣ API Flow (Critical Section)
-🔐 Register
-
-Validate input
-
-Hash password
-
-Insert user into MySQL
-
-Return success (NO tokens)
-
-🔐 Login
-
-Verify email + password
-
-Create access token
-
-Create refresh token + jti
-
-Store refresh jti in Redis
-
-Set cookies
-
-Return user profile
-
-🔄 Refresh Token Rotation
-
-Read refresh token cookie
-
-Verify JWT
-
-Check Redis for jti
-
-Delete old Redis key
-
-Issue new access + refresh
-
-Store new jti in Redis
-
-Update cookies
-
-🚨 If Redis key missing → force logout (possible theft)
-
-🚪 Logout
-
-Read refresh token
-
-Extract jti
-
-Delete Redis entry
-
-Clear cookies
-
-8️⃣ Middleware Protection (Next.js)
-middleware.ts
-
-
-Used for:
-
-Page-level auth
-
-Role-based access
-
-Logic:
-
-if no access_token → redirect to /login
-if invalid → try refresh
-if still invalid → logout
-
-
-⚠ Middleware never talks to DB
-⚠ Only JWT verification
-
-9️⃣ Security Checklist (Non-Negotiable)
-
-✅ bcrypt salt ≥ 12
-✅ Rotate refresh tokens
-✅ Redis-backed sessions
-✅ HTTP-only cookies
-✅ Separate JWT secrets
-✅ Rate-limit auth routes
-✅ CSRF protection (sameSite=strict)
-
-🔟 Why This Is “Best Practice”
-Feature	This Setup
-Stateless auth	✅
-Session revocation	✅
-Scales horizontally	✅
-Secure against XSS	✅
-Secure against token replay	✅
-Production-ready	✅
-What I can do next (pick one)
-
-🔹 Write actual code for each API route
-
-🔹 Provide JWT + Redis implementation
-
-🔹 Add role-based auth (RBAC)
-
-🔹 Add OAuth later (Google/GitHub)
-
-🔹 Convert this into a diagram / flowchart
-
-Just tell me how deep you want to go 🚀
-
-Convert this into a **diagram / flowchart**
-
-ye please also include the frontend interaction like signUp and signin
-
-Perfect — let’s extend the plan and cover frontend interaction + a clear auth flow diagram, exactly like you’d do before building a real product.
-
-I’ll break this into 3 clean layers:
-
-Visual Auth Flow Diagram
-
-Frontend pages & interaction logic (Signup / Signin)
-
-How frontend ↔ backend talk securely
-
-1️⃣ Full Auth Flow (Visual / Mental Model)
-Overall System Flow
-What’s happening in simple terms
-User → Login Form
-     → /api/auth/login
-     → MySQL (verify user)
-     → Redis (store refresh token jti)
-     → Cookies set
-     → Access protected pages
-
-Access token expires
-     → /api/auth/refresh
-     → Redis check + rotate
-     → New cookies
-
-2️⃣ Frontend Folder Structure (Auth-Aware)
+```
 src/
 ├── app/
 │   ├── auth/
 │   │   ├── login/
-│   │   │   └── page.tsx
+│   │   │   └── page.tsx           # Login page
 │   │   ├── register/
-│   │   │   └── page.tsx
-│   │   └── layout.tsx
+│   │   │   └── page.tsx           # Registration page
+│   │   └── layout.tsx             # Auth layout (guest only)
 │   │
 │   ├── (protected)/
 │   │   ├── dashboard/
-│   │   │   └── page.tsx
-│   │   └── layout.tsx
+│   │   │   └── page.tsx           # Dashboard page
+│   │   └── layout.tsx             # Protected layout wrapper
 │   │
-│   └── middleware.ts
+│   └── middleware.ts              # Next.js middleware
 │
 ├── components/
 │   ├── auth/
-│   │   ├── LoginForm.tsx
-│   │   └── RegisterForm.tsx
+│   │   ├── LoginForm.tsx          # Login form component
+│   │   └── RegisterForm.tsx       # Registration form component
 │   └── ui/
-│       └── Button.tsx
+│       └── Button.tsx             # Reusable UI components
 │
 ├── hooks/
-│   └── useAuth.ts
+│   └── useAuth.ts                 # Authentication hook
 │
 ├── services/
-│   └── auth.service.ts
+│   └── auth.service.ts            # Auth API service layer
 │
 └── types/
-    └── user.ts
+    └── user.ts                    # User type definitions
+```
 
-3️⃣ Frontend Auth State Strategy
-Key Rule
+---
 
-❌ Do NOT store tokens in state
-✅ Rely on HTTP-only cookies
+## 7. Core Utilities
 
-Frontend only cares about:
+### Password Hashing (bcryptjs)
 
-{
-  isAuthenticated: boolean
-  user: { id, email, role }
+```typescript
+import bcrypt from 'bcryptjs';
+
+const SALT_ROUNDS = 12;
+
+// Hash a password
+export async function hashPassword(password: string): Promise<string> {
+  return bcrypt.hash(password, SALT_ROUNDS);
 }
 
-4️⃣ Signup Flow (Frontend → Backend)
-UI Flow
-Signup Interaction
-User fills form
-→ POST /api/auth/register
-→ success → redirect to /auth/login
+// Verify a password
+export async function verifyPassword(
+  password: string, 
+  hash: string
+): Promise<boolean> {
+  return bcrypt.compare(password, hash);
+}
+```
 
-Register Form Logic
+> ✅ **Security Rules:**
+> - Never store plain text passwords
+> - Never reuse salts
+> - Use salt rounds ≥ 12
+
+### JWT Handling
+
+```typescript
+import jwt from 'jsonwebtoken';
+
+// Use SEPARATE secrets for access and refresh tokens
+const ACCESS_SECRET = process.env.ACCESS_TOKEN_SECRET!;
+const REFRESH_SECRET = process.env.REFRESH_TOKEN_SECRET!;
+
+export function signAccessToken(payload: TokenPayload): string {
+  return jwt.sign(payload, ACCESS_SECRET, { expiresIn: '15m' });
+}
+
+export function signRefreshToken(payload: TokenPayload, jti: string): string {
+  return jwt.sign({ ...payload, jti }, REFRESH_SECRET, { expiresIn: '7d' });
+}
+
+export function verifyAccessToken(token: string): TokenPayload {
+  return jwt.verify(token, ACCESS_SECRET) as TokenPayload;
+}
+
+export function verifyRefreshToken(token: string): RefreshTokenPayload {
+  return jwt.verify(token, REFRESH_SECRET) as RefreshTokenPayload;
+}
+```
+
+> ⚠️ **IMPORTANT:** Always use separate secrets for access and refresh tokens!
+
+### Cookie Strategy
+
+```typescript
+import { cookies } from 'next/headers';
+
+const COOKIE_OPTIONS = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'strict' as const,
+  path: '/',
+};
+
+export function setAuthCookies(accessToken: string, refreshToken: string) {
+  cookies().set('access_token', accessToken, {
+    ...COOKIE_OPTIONS,
+    maxAge: 15 * 60, // 15 minutes
+  });
+  
+  cookies().set('refresh_token', refreshToken, {
+    ...COOKIE_OPTIONS,
+    maxAge: 7 * 24 * 60 * 60, // 7 days
+  });
+}
+
+export function clearAuthCookies() {
+  cookies().delete('access_token');
+  cookies().delete('refresh_token');
+}
+```
+
+> 🚫 **Never use localStorage for tokens. Ever.**
+
+---
+
+## 8. API Flows
+
+### 🔐 Register Flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API as /api/auth/register
+    participant MySQL
+    
+    User->>API: POST { email, password }
+    API->>API: Validate input (Zod)
+    API->>API: Hash password (bcrypt)
+    API->>MySQL: INSERT user
+    MySQL-->>API: Success
+    API-->>User: 201 Created (NO tokens)
+```
+
+**Steps:**
+1. Validate input using Zod schema
+2. Hash password with bcrypt (12 rounds)
+3. Insert user into MySQL
+4. Return success response (**no tokens issued**)
+
+### 🔐 Login Flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API as /api/auth/login
+    participant MySQL
+    participant Redis
+    
+    User->>API: POST { email, password }
+    API->>MySQL: SELECT user by email
+    MySQL-->>API: User data
+    API->>API: Verify password (bcrypt)
+    API->>API: Generate access token
+    API->>API: Generate refresh token + jti
+    API->>Redis: SET refresh:{userId}:{jti}
+    API->>API: Set HTTP-only cookies
+    API-->>User: 200 OK + user profile
+```
+
+**Steps:**
+1. Verify email exists in MySQL
+2. Compare password with bcrypt
+3. Create access token (15 min)
+4. Create refresh token + unique `jti`
+5. Store `jti` in Redis
+6. Set HTTP-only cookies
+7. Return user profile
+
+### 🔄 Refresh Token Rotation
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as /api/auth/refresh
+    participant Redis
+    
+    Client->>API: POST (cookies included)
+    API->>API: Read refresh_token cookie
+    API->>API: Verify JWT signature
+    API->>Redis: CHECK refresh:{userId}:{jti}
+    
+    alt Token valid in Redis
+        Redis-->>API: EXISTS
+        API->>Redis: DELETE old key
+        API->>API: Generate new tokens
+        API->>Redis: SET new refresh:{userId}:{newJti}
+        API->>API: Update cookies
+        API-->>Client: 200 OK
+    else Token NOT in Redis
+        Redis-->>API: NOT EXISTS
+        API->>API: Clear cookies
+        API-->>Client: 401 Unauthorized (force logout)
+    end
+```
+
+> 🚨 **If Redis key is missing → Force logout** (possible token theft!)
+
+### 🚪 Logout Flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API as /api/auth/logout
+    participant Redis
+    
+    User->>API: POST (cookies included)
+    API->>API: Read refresh_token cookie
+    API->>API: Extract jti from token
+    API->>Redis: DELETE refresh:{userId}:{jti}
+    API->>API: Clear all auth cookies
+    API-->>User: 200 OK
+```
+
+---
+
+## Frontend Integration
+
+### 9. Frontend Auth State Strategy
+
+> ❌ **Do NOT store tokens in React state**  
+> ✅ **Rely on HTTP-only cookies**
+
+The frontend only manages:
+
+```typescript
+interface AuthState {
+  isAuthenticated: boolean;
+  user: {
+    id: string;
+    email: string;
+    role: 'user' | 'admin';
+  } | null;
+}
+```
+
+### 10. Signup Flow
+
+```mermaid
+flowchart LR
+    A[User fills form] --> B[POST /api/auth/register]
+    B --> C{Success?}
+    C -->|Yes| D[Redirect to /auth/login]
+    C -->|No| E[Show error message]
+```
+
+**Register Form Component:**
+
+```typescript
 // components/auth/RegisterForm.tsx
-const onSubmit = async (data) => {
-  setLoading(true)
+'use client';
 
-  const res = await fetch('/api/auth/register', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-  })
+import { useState } from 'react';
+import { useRouter } from 'next/navigation';
 
-  if (res.ok) {
-    router.push('/auth/login')
-  } else {
-    setError(await res.json())
-  }
+export function RegisterForm() {
+  const router = useRouter();
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  setLoading(false)
+  const onSubmit = async (data: { email: string; password: string }) => {
+    setLoading(true);
+    setError(null);
+
+    try {
+      const res = await fetch('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+
+      if (res.ok) {
+        router.push('/auth/login');
+      } else {
+        const errorData = await res.json();
+        setError(errorData.message || 'Registration failed');
+      }
+    } catch (err) {
+      setError('An unexpected error occurred');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ... form JSX
+}
+```
+
+> ⚠️ **Best Practice:** No auto-login after signup. Users should explicitly log in.
+
+### 11. Sign In Flow
+
+```mermaid
+flowchart LR
+    A[User submits credentials] --> B[POST /api/auth/login]
+    B --> C{Success?}
+    C -->|Yes| D[Cookies set automatically]
+    D --> E[Redirect to /dashboard]
+    C -->|No| F[Show error message]
+```
+
+**Login Form Component:**
+
+```typescript
+// components/auth/LoginForm.tsx
+'use client';
+
+import { useState } from 'react';
+import { useRouter } from 'next/navigation';
+
+export function LoginForm() {
+  const router = useRouter();
+  const [error, setError] = useState<string | null>(null);
+
+  const onSubmit = async (data: { email: string; password: string }) => {
+    setError(null);
+
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      credentials: 'include', // Important for cookies!
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+
+    if (res.ok) {
+      router.push('/dashboard');
+    } else {
+      setError('Invalid email or password');
+    }
+  };
+
+  // ... form JSX
+}
+```
+
+### 12. Protected Routes
+
+**useAuth Hook:**
+
+```typescript
+// hooks/useAuth.ts
+'use client';
+
+import { useState, useEffect } from 'react';
+
+interface User {
+  id: string;
+  email: string;
+  role: 'user' | 'admin';
 }
 
-
-⚠ No auto-login after signup (best practice).
-
-5️⃣ Sign In Flow (Frontend → Backend)
-UI Flow
-Login Interaction
-User submits email + password
-→ POST /api/auth/login
-→ cookies set (access + refresh)
-→ redirect to /dashboard
-
-Login Form Logic
-const onSubmit = async (data) => {
-  const res = await fetch('/api/auth/login', {
-    method: 'POST',
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-  })
-
-  if (res.ok) {
-    router.push('/dashboard')
-  } else {
-    setError('Invalid credentials')
-  }
-}
-
-6️⃣ Accessing Protected Data (Frontend)
-useAuth Hook
-export const useAuth = () => {
-  const [user, setUser] = useState(null)
-  const [loading, setLoading] = useState(true)
+export function useAuth() {
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     fetch('/api/auth/me', { credentials: 'include' })
-      .then(res => res.ok ? res.json() : null)
-      .then(setUser)
-      .finally(() => setLoading(false))
-  }, [])
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => setUser(data?.user ?? null))
+      .catch(() => setUser(null))
+      .finally(() => setLoading(false));
+  }, []);
 
-  return { user, loading, isAuthenticated: !!user }
+  return {
+    user,
+    loading,
+    isAuthenticated: !!user,
+  };
 }
+```
 
-7️⃣ Protected Layout Pattern (App Router)
+**Protected Layout:**
+
+```typescript
 // app/(protected)/layout.tsx
-export default function ProtectedLayout({ children }) {
-  const { isAuthenticated, loading } = useAuth()
+'use client';
 
-  if (loading) return <Spinner />
-  if (!isAuthenticated) redirect('/auth/login')
+import { redirect } from 'next/navigation';
+import { useAuth } from '@/hooks/useAuth';
+import { Spinner } from '@/components/ui/Spinner';
 
-  return children
-}
+export default function ProtectedLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const { isAuthenticated, loading } = useAuth();
 
-8️⃣ Token Expiry Handling (Frontend POV)
-When access token expires
-API call → 401
-→ frontend retries once
-→ /api/auth/refresh
-→ retry original request
-
-Centralized Fetch Wrapper
-export async function authFetch(url, options) {
-  let res = await fetch(url, { ...options, credentials: 'include' })
-
-  if (res.status === 401) {
-    await fetch('/api/auth/refresh', {
-      method: 'POST',
-      credentials: 'include',
-    })
-    res = await fetch(url, { ...options, credentials: 'include' })
+  if (loading) {
+    return <Spinner />;
   }
 
-  return res
+  if (!isAuthenticated) {
+    redirect('/auth/login');
+  }
+
+  return <>{children}</>;
+}
+```
+
+### 13. Token Expiry Handling
+
+```mermaid
+flowchart TD
+    A[API Call] --> B{Response 401?}
+    B -->|No| C[Return response]
+    B -->|Yes| D[Call /api/auth/refresh]
+    D --> E{Refresh successful?}
+    E -->|Yes| F[Retry original request]
+    E -->|No| G[Redirect to login]
+    F --> C
+```
+
+**Centralized Fetch Wrapper:**
+
+```typescript
+// services/auth.service.ts
+export async function authFetch(
+  url: string,
+  options: RequestInit = {}
+): Promise<Response> {
+  // First attempt
+  let res = await fetch(url, {
+    ...options,
+    credentials: 'include',
+  });
+
+  // If unauthorized, try refreshing token
+  if (res.status === 401) {
+    const refreshRes = await fetch('/api/auth/refresh', {
+      method: 'POST',
+      credentials: 'include',
+    });
+
+    if (refreshRes.ok) {
+      // Retry original request with new token
+      res = await fetch(url, {
+        ...options,
+        credentials: 'include',
+      });
+    }
+  }
+
+  return res;
+}
+```
+
+---
+
+## 14. Middleware Protection
+
+```typescript
+// middleware.ts
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+
+export function middleware(request: NextRequest) {
+  const token = request.cookies.get('access_token');
+  const isAuthPage = request.nextUrl.pathname.startsWith('/auth');
+  const isProtectedPage = request.nextUrl.pathname.startsWith('/dashboard');
+
+  // Redirect to login if accessing protected route without token
+  if (isProtectedPage && !token) {
+    return NextResponse.redirect(new URL('/auth/login', request.url));
+  }
+
+  // Redirect to dashboard if accessing auth pages while logged in
+  if (isAuthPage && token) {
+    return NextResponse.redirect(new URL('/dashboard', request.url));
+  }
+
+  return NextResponse.next();
 }
 
-9️⃣ Middleware (Page-Level Protection)
-export function middleware(req) {
-  const token = req.cookies.get('access_token')
-  if (!token) return NextResponse.redirect('/auth/login')
-}
+export const config = {
+  matcher: ['/dashboard/:path*', '/auth/:path*'],
+};
+```
 
+> ⚠️ **Middleware Rules:**
+> - ✅ Fast execution
+> - ✅ No database calls
+> - ✅ Runs at the edge
+> - ✅ Only JWT verification
 
-✔ Fast
-✔ No DB
-✔ Runs at edge
+---
 
-🔐 Final Mental Model (Remember This)
-Frontend NEVER sees tokens
-Cookies handle auth
-Redis controls sessions
-JWT handles identity
-MySQL stores truth
+## 15. Security Checklist
 
-Want next?
+### Non-Negotiable Requirements
 
-I can:
+| Requirement | Status | Description |
+|-------------|--------|-------------|
+| bcrypt salt ≥ 12 | ✅ | Adequate hashing rounds |
+| Rotate refresh tokens | ✅ | New token on each refresh |
+| Redis-backed sessions | ✅ | Server-side session control |
+| HTTP-only cookies | ✅ | Prevent XSS token theft |
+| Separate JWT secrets | ✅ | Different keys for access/refresh |
+| Rate-limit auth routes | ✅ | Prevent brute force attacks |
+| CSRF protection | ✅ | `sameSite=strict` cookies |
 
-🔹 Draw a clean ASCII / Mermaid diagram
+### Feature Comparison
 
-🔹 Write complete frontend code (React Hook Form + Zod)
+| Feature | This Setup |
+|---------|------------|
+| Stateless auth | ✅ |
+| Session revocation | ✅ |
+| Horizontal scaling | ✅ |
+| XSS protection | ✅ |
+| Token replay protection | ✅ |
+| Production-ready | ✅ |
 
-🔹 Add RBAC (admin/user UI guards)
+---
 
-🔹 Add Remember Me support
+## 16. Flow Diagrams
 
-🔹 Turn this into a real project boilerplate
+### Complete Authentication System Flow
+
+```mermaid
+flowchart TB
+    subgraph Frontend
+        A[Login Form] --> B[Submit Credentials]
+        C[Register Form] --> D[Create Account]
+        E[Protected Page] --> F[useAuth Hook]
+    end
+
+    subgraph Backend API
+        G[/api/auth/login]
+        H[/api/auth/register]
+        I[/api/auth/refresh]
+        J[/api/auth/logout]
+        K[/api/auth/me]
+    end
+
+    subgraph Storage
+        L[(MySQL)]
+        M[(Redis)]
+    end
+
+    B --> G
+    D --> H
+    F --> K
+
+    G --> L
+    G --> M
+    H --> L
+    I --> M
+    J --> M
+    K --> L
+
+    style Frontend fill:#e1f5fe
+    style Backend API fill:#fff3e0
+    style Storage fill:#f3e5f5
+```
+
+### Mental Model
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    🔐 AUTH SYSTEM                        │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│   Frontend NEVER sees tokens                            │
+│        ↓                                                │
+│   Cookies handle auth automatically                     │
+│        ↓                                                │
+│   Redis controls session validity                       │
+│        ↓                                                │
+│   JWT handles identity claims                           │
+│        ↓                                                │
+│   MySQL stores the source of truth                      │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 🚀 Next Steps
+
+Choose what to implement next:
+
+- [ ] Write actual code for each API route
+- [ ] Implement complete JWT + Redis logic
+- [ ] Add Role-Based Access Control (RBAC)
+- [ ] Add OAuth providers (Google/GitHub)
+- [ ] Add "Remember Me" functionality
+- [ ] Create a complete project boilerplate
+
+---
+
+## 📄 License
+
+This documentation is part of the `auth_app` project.
